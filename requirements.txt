@@ -1,0 +1,9 @@
+streamlit>=1.40
+pandas>=2.0
+numpy
+requests
+python-calamine
+xlrd>=2.0.1
+lxml
+html5lib
+beautifulsoup4
