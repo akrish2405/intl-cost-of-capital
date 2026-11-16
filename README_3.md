@@ -13,8 +13,17 @@ in the currency of any selected country**.
 | Statutory corporate tax rates | [OECD Corporate Tax Statistics 2024](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) |
 | 10-year government bond yields | [Trading Economics](https://tradingeconomics.com/bonds) (scraped, no API key) |
 
-If a source cannot be reached, the app flags it (⚠️) and asks for a manual input. The OECD
-page is mostly charts, so if its table cannot be parsed the app uses embedded OECD 2024 rates.
+### Bundled source downloads (`data/` folder)
+Some sites block automated downloads from Streamlit Cloud, so the app falls back to copies of the
+source data kept in the repo:
+| File | Content |
+|---|---|
+| `data/betas.xls` | Damodaran U.S. industry betas, downloaded file (updated 2026-01-05) |
+| `data/oecd_cit_2024.csv` | Statutory combined CIT rates for 143 jurisdictions, OECD *Corporate Tax Statistics 2024*, Figure 2.1. The figure has no printed values, so rates were measured from the PDF's vector bar lengths (`tools/extract_oecd_rates.py`), calibrated on known round rates; accuracy ±0.05 pp. Check e.g. U.S. 25.59% |
+| BBB spread fallback | Baa2/BBB = 1.11%, large non-financial firms, Damodaran ratings page (data as of January 2026) |
+
+The Data sources table in the app says whether each value is live or from these files. Every value
+can also be overridden manually in the sidebar.
 
 ## Features
 - Choose industry, target country, equity risk premium and target debt share
@@ -26,14 +35,26 @@ page is mostly charts, so if its table cannot be parsed the app uses embedded OE
 
 **Defaults:** Software (System & Application), United States, U.S. tax rate, ERP 6.5%, 30% debt.
 
-## Formulas
-- Levered beta: βL = βU × [1 + (1 − t) × D/E]
-- USD cost of equity: ke$ = y_US + βL × ERP
-- USD pre-tax cost of debt: kd$ = y_US + BBB spread
-- Foreign currency (default, multiplicative): (1 + k_FC) = (1 + k$) × (1 + y_FC) / (1 + y_US)
-  (an additive option k_FC = k$ + y_FC − y_US is also available)
-- FC cost of debt with spread override: kd_FC = y_FC + override spread
-- WACC = E/V × ke + D/V × kd × (1 − t)
+## Formulas (from class: Rebelo, Case Packet 2026)
+- Relevered beta: βE = βU × [1 + (1 − τ) × D/E], D/E = d/(1 − d)
+- USD cost of equity: Re = Rf + βE × ERP; USD pre-tax cost of debt: Rd = Rf + s
+- Conversion factor: F = (1 + Rf*)/(1 + Rf)
+- Foreign cost of equity: 1 + Re* = (1 + Re) × F
+- Foreign spread: s* = s × F (default) or manual override; Rd* = Rf* + s*
+- WACC = (1 − d) Re + d Rd (1 − τ)
+
+Check: the class Colombia example (βU 0.80, d 30%, τ 35%, ERP 6.5%, Rf 4%, Rf* 12%, s 1.5%)
+gives WACC 8.5265% (USD) and 16.0670% (COP), as in the slides.
+
+## Repository layout
+```
+app.py
+requirements.txt
+README.md
+data/betas.xls
+data/oecd_cit_2024.csv
+tools/extract_oecd_rates.py
+```
 
 ## Run locally
 ```bash

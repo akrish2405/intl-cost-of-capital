@@ -44,28 +44,18 @@ DEFAULT_COUNTRY = "United States"
 DEFAULT_ERP = 6.5      # %
 DEFAULT_DEBT = 30      # %
 
-# Fallback statutory combined (central + sub-central) CIT rates, %, OECD
-# Corporate Tax Statistics 2024 (tax year 2024). Used ONLY if the live OECD
-# page cannot be parsed. Verify against the OECD page before relying on them.
-OECD_FALLBACK_2024 = {
-    "Argentina": 35.0, "Australia": 30.0, "Austria": 23.0, "Belgium": 25.0,
-    "Brazil": 34.0, "Canada": 26.1, "Chile": 27.0, "China": 25.0,
-    "Colombia": 35.0, "Czech Republic": 21.0, "Denmark": 22.0, "Finland": 20.0,
-    "France": 25.8, "Germany": 29.9, "Greece": 22.0, "Hong Kong": 16.5,
-    "Hungary": 9.0, "India": 25.2, "Indonesia": 22.0, "Ireland": 12.5,
-    "Israel": 23.0, "Italy": 27.8, "Japan": 29.7, "Malaysia": 24.0,
-    "Mexico": 30.0, "Netherlands": 25.8, "New Zealand": 28.0, "Norway": 22.0,
-    "Philippines": 25.0, "Poland": 19.0, "Portugal": 31.5, "Saudi Arabia": 20.0,
-    "Singapore": 17.0, "South Africa": 27.0, "South Korea": 26.4, "Spain": 25.0,
-    "Sweden": 20.6, "Switzerland": 19.6, "Thailand": 20.0, "Turkey": 25.0,
-    "United Kingdom": 25.0, "United States": 25.8, "Vietnam": 20.0,
-}
+# Bundled copies of the source downloads (used when a live fetch fails)
+import os
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+BETAS_FILE = os.path.join(DATA_DIR, "betas.xls")            # Damodaran, updated 2026-01-05
+TAX_FILE = os.path.join(DATA_DIR, "oecd_cit_2024.csv")      # OECD CTS 2024, Figure 2.1
+BBB_FALLBACK = (0.0111, "January 2026")                      # Damodaran ratings.html, Baa2/BBB
 
 ALIASES = {
     "korea": "south korea", "republic of korea": "south korea",
     "czechia": "czech republic", "türkiye": "turkey", "turkiye": "turkey",
     "united states of america": "united states", "usa": "united states",
-    "us": "united states", "slovak republic": "slovakia",
+    "us": "united states", "uae": "united arab emirates", "u.k.": "united kingdom", "slovak republic": "slovakia",
     "hong kong, china": "hong kong", "hong kong (china)": "hong kong",
     "china (people's republic of)": "china", "viet nam": "vietnam",
 }
@@ -86,48 +76,74 @@ def now_str():
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def read_tables(html):
+    """pd.read_html with lxml, falling back to BeautifulSoup/html5lib."""
+    try:
+        return pd.read_html(io.StringIO(html))
+    except ImportError:
+        return pd.read_html(io.StringIO(html), flavor="bs4")
+
+
 # ---------------------------------------------------------------------------
 # Data fetchers (cached for 12 hours; "Refresh data" clears the cache)
 # ---------------------------------------------------------------------------
+def parse_betas(content: bytes):
+    """Parse Damodaran betas.xls bytes -> (DataFrame[Industry, Unlevered beta], date string)."""
+    xls = None
+    for engine in ("calamine", "xlrd"):   # pandas 3 reads .xls via python-calamine
+        try:
+            xls = pd.ExcelFile(io.BytesIO(content), engine=engine)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if xls is None:
+        raise ImportError("Install python-calamine or xlrd to read betas.xls")
+    sheet = next((s_ for s_ in xls.sheet_names if "industry" in s_.lower()), xls.sheet_names[0])
+    raw = xls.parse(sheet, header=None)
+
+    # Header row = the row whose first cell is "Industry Name"
+    first = raw.iloc[:, 0].astype("string").fillna("").str.strip()
+    hdr = int(first[first.str.lower() == "industry name"].index[0])
+
+    # "Date updated:" label -> next non-empty cell in that row
+    data_date = "n/a"
+    for i in range(hdr):
+        if "date" in str(raw.iat[i, 0]).lower():
+            vals = [v for v in raw.iloc[i, 1:].tolist() if pd.notna(v)]
+            if vals:
+                v = vals[0]
+                data_date = v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)
+            break
+
+    df = xls.parse(sheet, header=hdr)
+    df.columns = [str(c).strip() for c in df.columns]
+    name_col = next(c for c in df.columns if "industry" in c.lower())
+    ub_col = next(c for c in df.columns
+                  if c.lower().startswith("unlevered beta") and "cash" not in c.lower())
+    out = df[[name_col, ub_col]].rename(columns={name_col: "Industry", ub_col: "Unlevered beta"})
+    out["Unlevered beta"] = pd.to_numeric(out["Unlevered beta"], errors="coerce")
+    out = out.dropna()
+    out["Industry"] = out["Industry"].astype(str).str.strip()
+    out = out[~out["Industry"].str.contains("Total Market", case=False)].reset_index(drop=True)
+    return out, data_date
+
+
 @st.cache_data(ttl=43200, show_spinner=False)
 def fetch_betas():
-    """Damodaran U.S. industry betas -> DataFrame[Industry, Unlevered beta]."""
+    """Damodaran U.S. industry betas: live download, else the bundled data/betas.xls."""
     try:
         r = requests.get(BETA_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        xls = pd.ExcelFile(io.BytesIO(r.content))
-        sheet = next((s for s in xls.sheet_names if "industry" in s.lower()),
-                     xls.sheet_names[0])
-        raw = xls.parse(sheet, header=None)
-
-        # Locate the header row ("Industry Name")
-        is_hdr = raw.apply(lambda row: row.astype(str).str.contains(
-            "Industry Name", case=False).any(), axis=1)
-        hdr = int(raw.index[is_hdr][0])
-
-        # Data date: look for a "Date" label in the rows above the header
-        data_date = "n/a"
-        top = raw.iloc[:hdr].astype(str)
-        for _, row in top.iterrows():
-            vals = [v for v in row if v not in ("nan", "NaT")]
-            if any("date" in v.lower() for v in vals):
-                data_date = " ".join(vals)
-                break
-
-        df = xls.parse(sheet, header=hdr)
-        df.columns = [str(c).strip() for c in df.columns]
-        name_col = next(c for c in df.columns if "industry" in c.lower())
-        ub_col = next(c for c in df.columns
-                      if c.lower().startswith("unlevered beta") and "cash" not in c.lower())
-        out = df[[name_col, ub_col]].rename(
-            columns={name_col: "Industry", ub_col: "Unlevered beta"})
-        out["Unlevered beta"] = pd.to_numeric(out["Unlevered beta"], errors="coerce")
-        out = out.dropna()
-        out["Industry"] = out["Industry"].astype(str).str.strip()
-        out = out[~out["Industry"].str.contains("Total Market", case=False)]
-        out = out.reset_index(drop=True)
+        out, data_date = parse_betas(r.content)
         return {"data": out, "date": data_date, "fetched": now_str(), "ok": True,
-                "msg": f"{len(out)} industries loaded"}
+                "msg": f"Live: {len(out)} industries"}
+    except Exception as e:  # noqa: BLE001
+        live_err = str(e)[:80]
+    try:
+        with open(BETAS_FILE, "rb") as f:
+            out, data_date = parse_betas(f.read())
+        return {"data": out, "date": data_date, "fetched": now_str(), "ok": True,
+                "msg": f"Bundled download data/betas.xls ({len(out)} industries); live failed: {live_err}"}
     except Exception as e:  # noqa: BLE001
         return {"data": pd.DataFrame(columns=["Industry", "Unlevered beta"]),
                 "date": "n/a", "fetched": now_str(), "ok": False, "msg": str(e)}
@@ -145,7 +161,7 @@ def fetch_bbb_spread():
         text = r.text
         m = re.search(MONTH_RE, re.sub(r"<[^>]+>", " ", text))
         data_date = m.group(0) if m else "n/a"
-        tables = pd.read_html(io.StringIO(text))
+        tables = read_tables(text)
         # The FIRST table containing Baa2/BBB is the large non-financial table
         for t in tables:
             flat = t.astype(str)
@@ -159,7 +175,8 @@ def fetch_bbb_spread():
                         "msg": "Baa2/BBB, large non-financial service firms"}
         raise ValueError("Baa2/BBB row not found")
     except Exception as e:  # noqa: BLE001
-        return {"data": None, "date": "n/a", "fetched": now_str(), "ok": False, "msg": str(e)}
+        return {"data": BBB_FALLBACK[0], "date": BBB_FALLBACK[1], "fetched": now_str(),
+                "ok": True, "msg": f"Value from downloaded page (Baa2/BBB 1.11%); live failed: {str(e)[:60]}"}
 
 
 @st.cache_data(ttl=43200, show_spinner=False)
@@ -168,7 +185,7 @@ def fetch_tax_rates():
     try:
         r = requests.get(OECD_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        tables = pd.read_html(io.StringIO(r.text))
+        tables = read_tables(r.text)
         rates = {}
         for t in tables:
             if t.shape[1] < 2:
@@ -186,10 +203,12 @@ def fetch_tax_rates():
         return {"data": rates, "date": "Corporate Tax Statistics 2024", "fetched": now_str(),
                 "ok": True, "msg": f"{len(rates)} jurisdictions parsed live"}
     except Exception as e:  # noqa: BLE001
-        rates = {norm(k): v / 100 for k, v in OECD_FALLBACK_2024.items()}
+        tbl = pd.read_csv(TAX_FILE)
+        rates = {norm(c): float(v) / 100 for c, v in zip(tbl.iloc[:, 0], tbl.iloc[:, 1])}
         return {"data": rates, "date": "Corporate Tax Statistics 2024 (tax year 2024)",
-                "fetched": now_str(), "ok": False,
-                "msg": f"Live parse failed ({e}); using embedded OECD 2024 values"}
+                "fetched": now_str(), "ok": True,
+                "msg": ("Bundled data/oecd_cit_2024.csv from the OECD 2024 PDF (Figure 2.1, "
+                        f"{len(rates)} jurisdictions); live page blocked: {str(e)[:50]}")}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -199,7 +218,7 @@ def fetch_yields():
         r = requests.get(TE_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
         try:
-            tables = pd.read_html(io.StringIO(r.text))
+            tables = read_tables(r.text)
         except ValueError:
             tables = []
         if not any("Yield" in [str(c).strip() for c in t.columns] for t in tables):
@@ -250,56 +269,52 @@ def fetch_yields():
 # Core calculation (all inputs in DECIMALS)
 # ---------------------------------------------------------------------------
 def compute(beta_u, tax, debt_share, erp, y_us, y_fc, spread_usd,
-            spread_fc_override=None, method="multiplicative"):
+            spread_fc_override=None):
     """
-    Levered beta (Hamada):    bL = bU * [1 + (1 - t) * D/E]
-    USD cost of equity:       ke$ = y_US + bL * ERP
-    USD pre-tax cost of debt: kd$ = y_US + BBB spread
-    Foreign currency (FC):    multiplicative (interest-rate parity):
-                                  (1 + k_FC) = (1 + k$) * (1 + y_FC) / (1 + y_US)
-                              additive:  k_FC = k$ + (y_FC - y_US)
-    FC cost of debt:          converted kd$  (auto)  or  y_FC + override spread
-    WACC:                     E/V * ke + D/V * kd * (1 - t)
+    Formulas from class (Rebelo, Case Packet 2026, slides 564-585):
+      Relevering:            bE = bU * [1 + (1 - t) * D/E],  D/E = d / (1 - d)
+      USD cost of equity:    Re = Rf + bE * ERP
+      USD cost of debt:      Rd = Rf + s
+      Conversion factor:     F = (1 + Rf*) / (1 + Rf)
+      FC cost of equity:     1 + Re* = (1 + Re) * F
+      FC spread (default):   s* = s * F      ->  Rd* = Rf* + s*
+                             (equivalent to 1 + Rd* = (1 + Rd) * F)
+      FC spread (override):  Rd* = Rf* + s*_manual
+      WACC:                  (1 - d) Re + d Rd (1 - t)
     """
     d = debt_share
     e = 1 - d
     de = d / e if e > 0 else np.inf
     beta_l = beta_u * (1 + (1 - tax) * de)
-
-    def conv(r):
-        if method == "multiplicative":
-            return (1 + r) * (1 + y_fc) / (1 + y_us) - 1
-        return r + (y_fc - y_us)
+    F = (1 + y_fc) / (1 + y_us)
 
     ke_usd = y_us + beta_l * erp
     kd_usd = y_us + spread_usd
-    ke_fc = conv(ke_usd)
-    kd_fc_auto = conv(kd_usd)
-    spread_fc_auto = kd_fc_auto - y_fc
-    if spread_fc_override is None:
-        spread_fc, kd_fc = spread_fc_auto, kd_fc_auto
-    else:
-        spread_fc, kd_fc = spread_fc_override, y_fc + spread_fc_override
+    ke_fc = (1 + ke_usd) * F - 1
+    spread_fc_auto = spread_usd * F
+    spread_fc = spread_fc_auto if spread_fc_override is None else spread_fc_override
+    kd_fc = y_fc + spread_fc
 
     res = {}
     for cur, y, ke, sp, kd in (("USD", y_us, ke_usd, spread_usd, kd_usd),
                                ("FC", y_fc, ke_fc, spread_fc, kd_fc)):
         kd_at = kd * (1 - tax)
         res[cur] = {
-            "10Y government yield": y,
+            "10Y government yield (risk-free proxy)": y,
             "Unlevered beta": beta_u,
-            "Levered beta": beta_l,
+            "Relevered equity beta": beta_l,
             "Equity risk premium": erp,
             "Cost of equity": ke,
             "BBB borrowing spread": sp,
             "Pre-tax cost of debt": kd,
             "Project tax rate": tax,
             "After-tax cost of debt": kd_at,
-            "Equity weight (E/V)": e,
-            "Debt weight (D/V)": d,
+            "Equity weight (1 - d)": e,
+            "Debt weight (d)": d,
             "WACC": e * ke + d * kd_at,
         }
     res["FC_spread_auto"] = spread_fc_auto
+    res["F"] = F
     return res
 
 
@@ -330,7 +345,7 @@ yields = yld_src["data"]
 if yields:
     country_names = sorted({v[0] for v in yields.values()} | {DEFAULT_COUNTRY})
 else:
-    country_names = sorted(OECD_FALLBACK_2024.keys())
+    country_names = sorted({c.title() for c in tax_rates})
 # Use "United States" as the display label for the U.S. regardless of TE label
 country_names = [c for c in country_names if norm(c) != "united states"]
 country_names = [DEFAULT_COUNTRY] + country_names
@@ -349,10 +364,6 @@ erp_pct = sb.number_input("Equity risk premium (%)", 0.0, 20.0, DEFAULT_ERP, 0.1
 debt_pct = sb.slider("Target debt share D/(D+E) (%)", 0, 90, DEFAULT_DEBT, 1)
 tax_choice = sb.radio("Project tax rate", ["U.S. tax rate", "Selected-country tax rate"], index=0,
                       help="The same tax rate is used for both currencies.")
-method_label = sb.radio("Currency conversion",
-                        ["Multiplicative (interest-rate parity)", "Additive (yield differential)"],
-                        index=0)
-method = "multiplicative" if method_label.startswith("Multi") else "additive"
 
 # Fetched values
 beta_fetched = (float(betas_df.loc[betas_df["Industry"] == industry, "Unlevered beta"].iloc[0])
@@ -377,13 +388,13 @@ def override(label, fetched, default, key, step=0.01, fmt="%.2f", pct=True):
         v = sb.number_input(f"{label}{' (%)' if pct else ''}", value=float(round(shown, 4)),
                             step=step, format=fmt, key=f"val_{key}")
         return (v / 100 if pct else v), True
-    sb.caption(f"Fetched {label}: **{shown:.2f}{'%' if pct else ''}**")
+    sb.caption(f"Fetched {label}: **{shown:.{2 if pct else 4}f}{'%' if pct else ''}**")
     return fetched, False
 
 
 sb.header("Manual overrides")
 beta_u, ov_beta = override("unlevered beta", beta_fetched, 1.0, "beta", pct=False)
-tax_us, ov_tus = override("U.S. tax rate", tax_us_fetched, 25.8, "tus")
+tax_us, ov_tus = override("U.S. tax rate", tax_us_fetched, 25.59, "tus")
 tax_fc, ov_tfc = override(f"{country} tax rate", tax_fc_fetched, 25.0, f"tfc_{norm(country)}")
 spread_usd, ov_sp = override("USD BBB spread", spread_fetched, 1.5, "sp")
 y_us, ov_yus = override("U.S. 10Y yield", y_us_fetched, 4.0, "yus")
@@ -399,7 +410,7 @@ erp = erp_pct / 100
 debt = debt_pct / 100
 
 # Foreign-currency spread: auto unless overridden
-auto_res = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, None, method)
+auto_res = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, None)
 sb.header("Foreign-currency BBB spread")
 ov_sfc = sb.toggle("Override foreign-currency spread", value=False)
 if ov_sfc:
@@ -408,11 +419,11 @@ if ov_sfc:
                               step=0.01, format="%.2f")
     spread_fc_override = sfc_pct / 100
 else:
-    sb.caption(f"Auto-calculated FC spread: **{auto_res['FC_spread_auto'] * 100:.2f}%** "
-               "(converted USD cost of debt minus local 10Y yield)")
+    sb.caption(f"Auto-calculated FC spread: **{auto_res['FC_spread_auto'] * 100:.4f}%** "
+               f"= USD spread × F, with F = (1 + Rf*)/(1 + Rf) = {auto_res['F']:.6f}")
     spread_fc_override = None
 
-res = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, spread_fc_override, method)
+res = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, spread_fc_override)
 
 # ---------------------------------------------------------------------------
 # Results
@@ -431,7 +442,7 @@ c4.metric(f"WACC ({country})", f"{res['FC']['WACC']:.2%}",
 rows = list(res["USD"].keys())
 table = pd.DataFrame({"USD": [res["USD"][k] for k in rows],
                       fc_label: [res["FC"][k] for k in rows]}, index=rows)
-non_pct = {"Unlevered beta", "Levered beta"}
+non_pct = {"Unlevered beta", "Relevered equity beta"}
 display = table.copy().astype(object)
 for k in rows:
     for col in display.columns:
@@ -447,9 +458,9 @@ st.caption("Manual overrides active: " + (", ".join(overrides_used) if overrides
 
 # Download of results with inputs
 inputs = pd.DataFrame({
-    "Input": ["Industry", "Target country", "Tax choice", "Conversion method", "ERP",
+    "Input": ["Industry", "Target country", "Tax choice", "Conversion factor F", "ERP",
               "Debt share", "Overrides"],
-    "Value": [industry, country, tax_choice, method_label, f"{erp:.2%}", f"{debt:.0%}",
+    "Value": [industry, country, tax_choice, f"{res['F']:.6f}", f"{erp:.2%}", f"{debt:.0%}",
               ", ".join(overrides_used) or "none"],
 })
 csv_buf = io.StringIO()
@@ -463,21 +474,25 @@ st.download_button("⬇️ Download results (CSV)", csv_buf.getvalue(),
 # ---------------------------------------------------------------------------
 # Assumptions
 # ---------------------------------------------------------------------------
-with st.expander("Main assumptions and formulas", expanded=False):
+with st.expander("Main assumptions and formulas", expanded=True):
     st.markdown(f"""
-- **Levered beta** (Hamada): βL = βU × [1 + (1 − t) × D/E], with D/E = D/V ÷ (1 − D/V).
-  βU is Damodaran's U.S. industry unlevered beta (U.S. industry risk applies globally).
-- **USD cost of equity (CAPM):** ke$ = U.S. 10Y yield + βL × ERP.
-- **USD pre-tax cost of debt:** kd$ = U.S. 10Y yield + Baa2/BBB spread (Damodaran, large
-  non-financial firms). The project is assumed to borrow at a BBB rating.
-- **Foreign-currency rates:** {"(1 + k_FC) = (1 + k$) × (1 + y_FC) / (1 + y_US) — the 10Y yield ratio proxies expected inflation / currency depreciation (interest-rate parity)." if method == "multiplicative" else "k_FC = k$ + (y_FC − y_US) — the yield differential is added to each USD rate."}
-  The 10Y government yields are treated as the risk-free rates in each currency
-  (no separate country default spread is removed).
-- **Foreign-currency spread:** auto = converted USD cost of debt − local 10Y yield. If
-  overridden, FC cost of debt = local 10Y yield + override spread; USD results are unaffected.
-- **Same project tax rate, debt share and ERP** are used in both currencies; the tax rate is
-  the statutory combined CIT rate (OECD).
-- **WACC** = E/V × ke + D/V × kd × (1 − t).
+**Formulas** (d = target debt share, τ = project tax rate, * = foreign currency)
+- Relevered beta: βE = βU × [1 + (1 − τ) × D/E], with D/E = d/(1 − d)
+- USD cost of equity: Re = Rf + βE × ERP  · USD pre-tax cost of debt: Rd = Rf + s
+- Conversion factor: F = (1 + Rf*)/(1 + Rf) = **{res['F']:.6f}**
+- Foreign cost of equity: 1 + Re* = (1 + Re) × F
+- Foreign borrowing spread: s* = s × F (default) or manual override; Rd* = Rf* + s*
+- WACC = (1 − d) Re + d Rd (1 − τ), computed in each currency with the same d, τ and ERP
+
+**Key approximations**
+- Risk is measured relative to the U.S. market; U.S. industry betas proxy for project risk.
+- 10-year government yields are the risk-free proxies; they include liquidity and term
+  premia and may include sovereign default risk.
+- Currency conversion assumes equal real rates and relative PPP, so the yield ratio
+  reflects expected depreciation. No separate currency-risk premium (FX betas ≈ 0).
+- No separate country equity risk premium.
+- Target leverage is constant, interest deductions are fully usable, and unlevering
+  assumes a zero debt beta.
 """)
 
 # ---------------------------------------------------------------------------
@@ -489,9 +504,9 @@ if betas_df.empty:
 else:
     recs = []
     for ind, bu in zip(betas_df["Industry"], betas_df["Unlevered beta"]):
-        r_ = compute(bu, tax, debt, erp, y_us, y_fc, spread_usd, spread_fc_override, method)
+        r_ = compute(bu, tax, debt, erp, y_us, y_fc, spread_usd, spread_fc_override)
         recs.append({"Industry": ind, "Unlevered beta": bu,
-                     "Levered beta": r_["USD"]["Levered beta"],
+                     "Relevered beta": r_["USD"]["Relevered equity beta"],
                      "Cost of equity USD": r_["USD"]["Cost of equity"],
                      f"Cost of equity {country}": r_["FC"]["Cost of equity"],
                      "WACC USD": r_["USD"]["WACC"],
@@ -502,7 +517,7 @@ else:
                "industry's fetched beta.")
     pct_cols = [c for c in all_df.columns if c.startswith(("Cost", "WACC"))]
     st.dataframe(all_df.style.format({**{c: "{:.2%}" for c in pct_cols},
-                                      "Unlevered beta": "{:.3f}", "Levered beta": "{:.3f}"}),
+                                      "Unlevered beta": "{:.3f}", "Relevered beta": "{:.3f}"}),
                  width="stretch", height=380)
     st.bar_chart(all_df.set_index("Industry")[["WACC USD", f"WACC {country}"]].head(25) * 100,
                  y_label="WACC (%) — top 25 industries", stack=False)
@@ -515,14 +530,21 @@ else:
 # Built-in verification checks
 # ---------------------------------------------------------------------------
 with st.expander("Verification checks (run live on current inputs)"):
-    eq = compute(beta_u, tax, debt, erp, y_us, y_us, spread_usd, None, method)
+    eq = compute(beta_u, tax, debt, erp, y_us, y_us, spread_usd, None)
     chk1 = np.isclose(eq["USD"]["WACC"], eq["FC"]["WACC"]) and \
         np.isclose(eq["USD"]["Cost of equity"], eq["FC"]["Cost of equity"])
-    z = compute(beta_u, tax, 0.0, erp, y_us, y_fc, spread_usd, spread_fc_override, method)
+    z = compute(beta_u, tax, 0.0, erp, y_us, y_fc, spread_usd, spread_fc_override)
     chk2 = np.isclose(z["USD"]["WACC"], z["USD"]["Cost of equity"]) and \
         np.isclose(z["FC"]["WACC"], z["FC"]["Cost of equity"])
-    o = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, 0.05, method)
+    o = compute(beta_u, tax, debt, erp, y_us, y_fc, spread_usd, 0.05)
     chk3 = all(np.isclose(o["USD"][k], res["USD"][k]) for k in rows if k in o["USD"])
+    col = compute(0.80, 0.35, 0.30, 0.065, 0.04, 0.12, 0.015)
+    chk0 = (round(col["USD"]["WACC"] * 100, 4) == 8.5265 and
+            round(col["FC"]["WACC"] * 100, 4) == 16.0670)
+    st.write(f"{'✅' if chk0 else '❌'} Class Colombia example (βU 0.80, d 30%, τ 35%, ERP 6.5%, "
+             f"Rf 4%, Rf* 12%, s 1.5%): WACC USD {col['USD']['WACC']:.4%} (slide: 8.5265%), "
+             f"COP {col['FC']['WACC']:.4%} (slide: 16.0670%); Re* {col['FC']['Cost of equity']:.4%}, "
+             f"s* {col['FC']['BBB borrowing spread']:.4%}")
     st.write(f"{'✅' if chk1 else '❌'} Equal 10Y yields (FC spread override off) → identical "
              f"USD and FC results (WACC {eq['USD']['WACC']:.4%} vs {eq['FC']['WACC']:.4%})")
     st.write(f"{'✅' if chk2 else '❌'} Zero debt → WACC equals cost of equity "
@@ -546,4 +568,5 @@ src = pd.DataFrame([
 ], columns=["Data", "Provider", "URL", "Data date", "Fetched", "Status", "Note"])
 st.dataframe(src, width="stretch", hide_index=True,
              column_config={"URL": st.column_config.LinkColumn("URL")})
-st.caption("Any source marked ⚠️ failed to load live; use the sidebar overrides for those values.")
+st.caption("Notes say whether each value is live or from the bundled source downloads in the repo's data/ folder. "
+           "Any source marked ⚠️ could not be loaded; use the sidebar overrides for those values.")
